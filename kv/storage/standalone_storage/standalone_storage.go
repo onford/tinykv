@@ -1,7 +1,6 @@
 package standalone_storage
 
 import (
-	// "fmt"
 	"sort"
 
 	"github.com/pingcap-incubator/tinykv/kv/config"
@@ -90,7 +89,6 @@ func (s *StandAloneStorage) GetCF(cf string, key []byte) ([]byte, error) {
 }
 
 func (s *StandAloneStorage) IterCF(cf string) engine_util.DBIterator {
-	// 这个还没实现
 	var keys []byte
 	mmap := make(map[byte][]byte)
 	for key, value := range s.Data[cf] {
@@ -121,7 +119,6 @@ func (s *StandAloneIterator) Item() engine_util.DBItem {
 	}
 	vvalue := make([]byte, len(s.Data[s.Key[s.index]]))
 	copy(vvalue, s.Data[s.Key[s.index]])
-	// fmt.Println("Vvalue:%s", vvalue, s.Data[s.Key[s.index]])
 	return &StandAloneItem{
 		Kkey:   []byte{s.Key[s.index]},
 		Vvalue: vvalue,
