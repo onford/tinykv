@@ -87,6 +87,7 @@ func TestLeaderElection2AA(t *testing.T) {
 	}
 
 	for i, tt := range tests {
+		// fmt.Printf("CASE %d", i)
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		sm := tt.network.peers[1].(*Raft)
 		if sm.State != tt.state {
@@ -1632,10 +1633,12 @@ func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *netw
 func (nw *network) send(msgs ...pb.Message) {
 	for len(msgs) > 0 {
 		m := msgs[0]
+		// fmt.Printf("Message: %s\n", m.String())
 		p := nw.peers[m.To]
 		p.Step(m)
 		msgs = append(msgs[1:], nw.filter(p.readMessages())...)
 	}
+	// fmt.Println("HandleOver")
 }
 
 func (nw *network) drop(from, to uint64, perc float64) {

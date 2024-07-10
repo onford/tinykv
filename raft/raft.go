@@ -16,6 +16,8 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -112,7 +114,8 @@ type Raft struct {
 
 	Term uint64
 	Vote uint64
-
+	// 多少人给我投票了
+	Favors uint64
 	// the log
 	RaftLog *RaftLog
 
@@ -135,6 +138,8 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
+	// 实际的 election interval 值
+	electionActual int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -165,7 +170,22 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	prs := make(map[uint64]*Progress)
+	Votes := make(map[uint64]bool)
+	for _, pr := range c.peers {
+		prs[pr] = &Progress{}
+		Votes[pr] = false
+	}
+	rand.Seed(time.Now().UnixNano())
+	tk := c.ElectionTick
+	return &Raft{
+		id:               c.ID,
+		votes:            Votes,
+		Prs:              prs,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  tk,
+		electionActual:   tk + 1 + rand.Intn(tk-1),
+	}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,37 +198,199 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	r.msgs = append(r.msgs, pb.Message{
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		MsgType: pb.MessageType_MsgHeartbeat,
+	})
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	switch r.State {
+	case StateFollower:
+		r.electionElapsed++
+		if r.electionElapsed == r.electionActual {
+			r.becomeCandidate()
+			r.readMessages() // 发出新的请求之前，清空原有的请求
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      pr,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgRequestVote,
+					})
+				}
+			}
+		}
+	case StateCandidate:
+		r.electionElapsed++
+		if r.electionElapsed == r.electionActual {
+			r.becomeCandidate()
+			r.readMessages() // 发出新的请求之前，清空原有的请求
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      pr,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgRequestVote,
+					})
+				}
+			}
+		}
+	case StateLeader:
+		r.heartbeatElapsed++
+		// 心该跳的时候就跳，向其他 nodes 发送心跳消息
+		if r.heartbeatElapsed == r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.sendHeartbeat(pr)
+				}
+			}
+		}
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.Term = term
+	r.Lead = lead
+	r.State = StateFollower
+	r.Vote = None         // 重置选票
+	r.electionElapsed = 0 // 选举时间回满
+	r.electionActual = r.electionTimeout + 1 + rand.Intn(r.electionTimeout-1)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.State = StateCandidate
+	r.Term++
+	r.electionElapsed = 0
+	r.electionActual = r.electionTimeout + 1 + rand.Intn(r.electionTimeout-1)
+	r.Favors = 1
+	r.votes[r.id] = true // 我选我自己
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.Lead = r.id
+	r.heartbeatElapsed = 0 //开始心跳
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if r.Term < m.Term {
+		r.becomeFollower(m.Term, 0) // 老旧的任期将被淘汰,并变成 Follower
+		// QUESTION: 领导人是？
+	}
+	if m.MsgType == pb.MessageType_MsgAppend {
+		if m.Term >= r.Term {
+			r.becomeFollower(m.Term, m.From)
+
+		}
+		return nil
+	}
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			r.readMessages() // 发出新的请求之前，清空原有的请求
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      pr,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgRequestVote,
+					})
+				}
+			}
+			r.Lead = 0
+			if 2*r.Favors >= uint64(len(r.Prs)) {
+				r.State = StateLeader
+				r.Lead = r.id
+			}
+		case pb.MessageType_MsgRequestVote:
+			if m.To == r.id {
+				reject := true
+				if r.Vote == None || r.Vote == m.From {
+					reject = false
+					r.Vote = m.From // 不予拒绝
+				}
+				r.msgs = append(r.msgs, pb.Message{
+					From:    r.id,
+					To:      m.From,
+					Term:    r.Term,
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					Reject:  reject,
+				})
+			}
+		}
 	case StateCandidate:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			r.readMessages() // 发出新的请求之前，清空原有的请求
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      pr,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgRequestVote,
+					})
+				}
+			}
+			r.Lead = 0
+		case pb.MessageType_MsgRequestVote:
+			// Candidate 给自己投票，不给别的 Candidate 投票
+			r.msgs = append(r.msgs, pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				Reject:  true, // 拒绝
+			})
+		case pb.MessageType_MsgRequestVoteResponse:
+			if m.To == r.id && !m.Reject {
+				r.Favors++
+			}
+			if 2*r.Favors > uint64(len(r.Prs)) {
+				r.State = StateLeader
+				r.Lead = r.id
+			}
+		}
 	case StateLeader:
+		switch m.MsgType {
+		case pb.MessageType_MsgRequestVote:
+			r.msgs = append(r.msgs, pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				Reject:  true, // 拒绝
+			})
+		case pb.MessageType_MsgBeat:
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.sendHeartbeat(pr)
+				}
+			}
+		}
+
 	}
 	return nil
 }
