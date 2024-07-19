@@ -365,6 +365,7 @@ func TestLeaderStartReplication2AB(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, s)
 	r.becomeCandidate()
 	r.becomeLeader()
+
 	commitNoopEntry(r, s)
 	li := r.RaftLog.LastIndex()
 
@@ -898,6 +899,7 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 
 		r.sendAppend(id)
 	}
+
 	// simulate the response of MessageType_MsgAppend
 	msgs := r.readMessages()
 	for _, m := range msgs {
@@ -905,10 +907,13 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 			panic("not a message to append noop entry")
 		}
 		r.Step(acceptAndReply(m))
+
 	}
+
 	// ignore further messages to refresh followers' commit index
 	r.readMessages()
 	s.Append(r.RaftLog.unstableEntries())
+
 	r.RaftLog.applied = r.RaftLog.committed
 	r.RaftLog.stabled = r.RaftLog.LastIndex()
 }

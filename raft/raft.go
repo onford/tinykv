@@ -116,6 +116,8 @@ type Raft struct {
 	Vote uint64
 	// 多少人给我投票了
 	Favors uint64
+	// 多少人拒绝我了
+	Rejects uint64
 	// the log
 	RaftLog *RaftLog
 
@@ -178,13 +180,18 @@ func newRaft(c *Config) *Raft {
 	}
 	rand.Seed(time.Now().UnixNano())
 	tk := c.ElectionTick
+
+	hardState, _, _ := c.Storage.InitialState()
 	return &Raft{
 		id:               c.ID,
 		votes:            Votes,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
 		Prs:              prs,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  tk,
 		electionActual:   tk + 1 + rand.Intn(tk-1),
+		RaftLog:          newLog(c.Storage),
 	}
 }
 
@@ -192,7 +199,19 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	entries := make([]*pb.Entry, 0, r.RaftLog.LastIndex()-r.RaftLog.committed)
+	for index := r.RaftLog.committed + 1; index <= r.RaftLog.LastIndex(); index++ {
+		entries = append(entries, &r.RaftLog.entries[index])
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		From:    r.id,
+		To:      to,
+		MsgType: pb.MessageType_MsgAppend,
+		Term:    r.Term,
+		Index:   r.RaftLog.committed, // 发送的是没有 commit 的日志
+		Entries: entries,
+	})
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -215,32 +234,14 @@ func (r *Raft) tick() {
 		if r.electionElapsed == r.electionActual {
 			r.becomeCandidate()
 			r.readMessages() // 发出新的请求之前，清空原有的请求
-			for pr := range r.Prs {
-				if pr != r.id {
-					r.msgs = append(r.msgs, pb.Message{
-						From:    r.id,
-						To:      pr,
-						Term:    r.Term,
-						MsgType: pb.MessageType_MsgRequestVote,
-					})
-				}
-			}
+			r.sendVoteRequestToAll()
 		}
 	case StateCandidate:
 		r.electionElapsed++
 		if r.electionElapsed == r.electionActual {
 			r.becomeCandidate()
 			r.readMessages() // 发出新的请求之前，清空原有的请求
-			for pr := range r.Prs {
-				if pr != r.id {
-					r.msgs = append(r.msgs, pb.Message{
-						From:    r.id,
-						To:      pr,
-						Term:    r.Term,
-						MsgType: pb.MessageType_MsgRequestVote,
-					})
-				}
-			}
+			r.sendVoteRequestToAll()
 		}
 	case StateLeader:
 		r.heartbeatElapsed++
@@ -275,6 +276,7 @@ func (r *Raft) becomeCandidate() {
 	r.electionElapsed = 0
 	r.electionActual = r.electionTimeout + 1 + rand.Intn(r.electionTimeout-1)
 	r.Favors = 1
+	r.Rejects = 0
 	r.votes[r.id] = true // 我选我自己
 }
 
@@ -285,6 +287,13 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 	r.heartbeatElapsed = 0 //开始心跳
+	// noop entry
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		Term:  r.Term,
+		Index: r.RaftLog.entries[0].Index + r.RaftLog.LastIndex() + 1,
+	})
+	r.setLast(r.id, r.RaftLog.LastIndex(), uint64(len(r.Prs)))
+	r.Prs[r.id].Match, r.Prs[r.id].Next = r.RaftLog.LastIndex(), r.RaftLog.LastIndex()+1
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -292,15 +301,12 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if r.Term < m.Term {
-		r.becomeFollower(m.Term, 0) // 老旧的任期将被淘汰,并变成 Follower
-		// QUESTION: 领导人是？
+		r.becomeFollower(m.Term, None) // 老旧的任期将被淘汰，并变成 Follower，暂时不知道领导者是谁
 	}
 	if m.MsgType == pb.MessageType_MsgAppend {
 		if m.Term >= r.Term {
 			r.becomeFollower(m.Term, m.From)
-
 		}
-		return nil
 	}
 	switch r.State {
 	case StateFollower:
@@ -308,37 +314,36 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
 			r.readMessages() // 发出新的请求之前，清空原有的请求
-			for pr := range r.Prs {
-				if pr != r.id {
-					r.msgs = append(r.msgs, pb.Message{
-						From:    r.id,
-						To:      pr,
-						Term:    r.Term,
-						MsgType: pb.MessageType_MsgRequestVote,
-					})
-				}
-			}
+			r.sendVoteRequestToAll()
 			r.Lead = 0
-			if 2*r.Favors >= uint64(len(r.Prs)) {
-				r.State = StateLeader
-				r.Lead = r.id
+			if 2*r.Favors > uint64(len(r.Prs)) {
+				r.becomeLeader()
+				r.msgs = append(r.msgs, pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose})
+			} else if 2*r.Rejects >= uint64(len(r.Prs)) {
+				r.becomeFollower(r.Term, r.Lead)
 			}
 		case pb.MessageType_MsgRequestVote:
-			if m.To == r.id {
-				reject := true
-				if r.Vote == None || r.Vote == m.From {
-					reject = false
-					r.Vote = m.From // 不予拒绝
-				}
-				r.msgs = append(r.msgs, pb.Message{
-					From:    r.id,
-					To:      m.From,
-					Term:    r.Term,
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					Reject:  reject,
-				})
+			reject := true
+			if (r.Vote == None || r.Vote == m.From) && (r.RaftLog.LastTerm() < m.LogTerm || r.RaftLog.LastTerm() == m.LogTerm && r.RaftLog.LastIndex() <= m.Index) {
+				reject = false
+				r.Vote = m.From // 不予拒绝
 			}
+			// if reject {
+			// 	fmt.Println("Rejected:", r.Term, m.From, m.To, r.RaftLog.LastTerm(), m.LogTerm)
+			// }
+			r.msgs = append(r.msgs, pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				Reject:  reject,
+			})
+		case pb.MessageType_MsgHeartbeat:
+			r.handleHeartbeat(m)
+		case pb.MessageType_MsgAppend:
+			r.handleAppendEntries(m)
 		}
+
 	case StateCandidate:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
@@ -351,6 +356,8 @@ func (r *Raft) Step(m pb.Message) error {
 						To:      pr,
 						Term:    r.Term,
 						MsgType: pb.MessageType_MsgRequestVote,
+						Index:   r.RaftLog.LastIndex(),
+						LogTerm: r.RaftLog.LastTerm(),
 					})
 				}
 			}
@@ -365,13 +372,21 @@ func (r *Raft) Step(m pb.Message) error {
 				Reject:  true, // 拒绝
 			})
 		case pb.MessageType_MsgRequestVoteResponse:
-			if m.To == r.id && !m.Reject {
-				r.Favors++
+			if m.To == r.id {
+				if m.Reject {
+					r.Rejects++
+				} else {
+					r.Favors++
+				}
 			}
 			if 2*r.Favors > uint64(len(r.Prs)) {
-				r.State = StateLeader
-				r.Lead = r.id
+				r.becomeLeader()
+				r.msgs = append(r.msgs, pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose})
+			} else if 2*r.Rejects >= uint64(len(r.Prs)) {
+				r.becomeFollower(r.Term, r.Lead)
 			}
+		case pb.MessageType_MsgHeartbeat:
+			r.handleHeartbeat(m)
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -389,20 +404,206 @@ func (r *Raft) Step(m pb.Message) error {
 					r.sendHeartbeat(pr)
 				}
 			}
+		case pb.MessageType_MsgHeartbeatResponse:
+			// 发现跟随者有老旧的日志，发送更新的 rpc 请求
+			if m.LogTerm < r.RaftLog.LastTerm() || m.LogTerm == r.RaftLog.LastTerm() && m.Index < r.RaftLog.LastIndex() {
+				entries := make([]*pb.Entry, 0, uint64(len(r.RaftLog.entries)))
+				for index := m.Index; index < uint64(len(r.RaftLog.entries)); index++ {
+					entries = append(entries, &r.RaftLog.entries[index])
+				}
+				r.msgs = append(r.msgs, pb.Message{
+					From:    r.id,
+					To:      m.From,
+					Term:    r.Term,
+					MsgType: pb.MessageType_MsgAppend,
+					Index:   m.Index,
+					LogTerm: m.LogTerm,
+					Commit:  r.RaftLog.committed,
+					Entries: entries,
+				})
+			}
+		case pb.MessageType_MsgPropose:
+			for index, entry := range m.Entries {
+				entry.Term = r.Term
+				entry.Index = r.RaftLog.LastIndex() + 1 + uint64(index)
+			}
+			for pr := range r.Prs {
+				if pr != r.id {
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      pr,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgAppend,
+						Index:   r.RaftLog.LastIndex(),
+						LogTerm: r.RaftLog.LastTerm(),
+						Commit:  r.RaftLog.committed,
+						Entries: m.Entries,
+					})
+				}
+			}
+			for _, entries := range m.Entries {
+				r.RaftLog.entries = append(r.RaftLog.entries, *entries)
+			}
+			r.setLast(r.id, r.RaftLog.LastIndex(), uint64(len(r.Prs)))
+			r.Prs[r.id].Match, r.Prs[r.id].Next = r.RaftLog.LastIndex(), r.RaftLog.LastIndex()+1
+		case pb.MessageType_MsgAppendResponse:
+			if m.To == r.id {
+				if !m.Reject {
+					committed := r.RaftLog.committed
+					r.setLast(m.From, m.Index, uint64(len(r.Prs)))
+					if committed != r.RaftLog.committed {
+						// committed 更新了，立刻发布给跟随者
+						for pr := range r.Prs {
+							if pr != r.id {
+								r.msgs = append(r.msgs, pb.Message{
+									From:    r.id,
+									To:      pr,
+									Term:    r.Term,
+									MsgType: pb.MessageType_MsgAppend,
+									Commit:  r.RaftLog.committed,
+								})
+							}
+						}
+
+					}
+				} else {
+					// 减小 index 重新发送 append rpc 请求
+					entries := make([]*pb.Entry, 0)
+					for idx := m.Index - 1; idx < uint64(len(r.RaftLog.entries)); idx++ {
+						entries = append(entries, &r.RaftLog.entries[idx])
+					}
+					r.msgs = append(r.msgs, pb.Message{
+						From:    r.id,
+						To:      m.From,
+						Term:    r.Term,
+						MsgType: pb.MessageType_MsgAppend,
+						Index:   m.Index - 1,
+						LogTerm: entries[0].Term,
+						Commit:  r.RaftLog.committed,
+						Entries: entries,
+					})
+				}
+			}
 		}
 
 	}
 	return nil
 }
 
+// 更新领导者的易失存储中 peer 号节点的日志的 LastIndex 值为 newLast
+func (r *Raft) setLast(peer uint64, newLast uint64, peers uint64) {
+	r.Prs[peer].Match, r.Prs[peer].Next = newLast, newLast+1
+	l := r.RaftLog
+	l.indexCount[l.peerLast[peer]]--
+	l.peerLast[peer] = newLast
+	l.indexCount[l.peerLast[peer]]++
+	count := uint64(0)
+	currentTerm := l.LastTerm() // 只会提交当前任期的日志
+	for index := l.LastIndex(); index > l.committed && l.entries[index].Term == currentTerm; index-- {
+		count += l.indexCount[index]
+		if 2*count > peers {
+			l.committed = index
+			return
+		}
+	}
+}
+
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	rejectMessage := pb.Message{
+		From:    r.id,
+		To:      m.From,
+		Term:    m.Term,
+		MsgType: pb.MessageType_MsgAppendResponse,
+		Index:   m.Index,
+		Reject:  true,
+	}
+	// 拒收老旧的消息
+	if m.Term == r.Term {
+		haveEntry, _ := r.haveEntry(m.Index, m.LogTerm)
+		if !haveEntry {
+			r.msgs = append(r.msgs, rejectMessage)
+			// fmt.Println("rejectWithindex,logTerm:", m.Index, m.LogTerm) // ???????????????
+			return
+		}
+		for index := 0; index < len(m.Entries); index++ {
+			term, err := r.RaftLog.Term(m.Entries[index].Index)
+			if err != nil || term != m.Entries[index].Term {
+				r.RaftLog.stabled = m.Entries[index].Index - 1
+				r.RaftLog.storage.(*MemoryStorage).Append(r.RaftLog.entries[:m.Entries[index].Index])
+				r.RaftLog.entries = r.RaftLog.entries[:m.Entries[index].Index]
+				for ; index < len(m.Entries); index++ {
+					r.RaftLog.entries = append(r.RaftLog.entries, *m.Entries[index])
+				}
+			}
+		}
+		if m.Commit > r.RaftLog.committed {
+			if m.Entries == nil {
+				if m.Index == 0 {
+					r.RaftLog.committed = m.Commit
+				} else {
+					r.RaftLog.committed = min(m.Commit, m.Index)
+				}
+			} else {
+				r.RaftLog.committed = min(m.Commit, m.Entries[len(m.Entries)-1].Index)
+			}
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Term:    m.Term,
+			Index:   r.RaftLog.LastIndex(),
+		})
+	} else {
+		// fmt.Println("Unexpected surprise")
+		r.msgs = append(r.msgs, rejectMessage)
+	}
+}
+
+// 判断一个 Raft 是否拥有对应的 entry，并返回位置
+func (r *Raft) haveEntry(index, term uint64) (bool, uint64) {
+	if index == 0 && term == 0 {
+		return true, 0
+	}
+	for idx, entry := range r.RaftLog.allEntries() {
+		if entry.Term == term && entry.Index == index {
+			return true, uint64(idx + 1)
+		}
+	}
+	return false, 0
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	if m.To == r.id {
+		r.becomeFollower(m.Term, m.From)
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			MsgType: pb.MessageType_MsgHeartbeatResponse,
+			Term:    r.Term,
+			Index:   r.RaftLog.LastIndex(),
+			LogTerm: r.RaftLog.LastTerm(),
+		})
+	}
+}
+
+func (r *Raft) sendVoteRequestToAll() {
+	for pr := range r.Prs {
+		if pr != r.id {
+			r.msgs = append(r.msgs, pb.Message{
+				From:    r.id,
+				To:      pr,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgRequestVote,
+				Index:   r.RaftLog.LastIndex(),
+				LogTerm: r.RaftLog.LastTerm(),
+			})
+		}
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request

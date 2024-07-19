@@ -177,6 +177,9 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	for i := range n.peers {
 		sm := n.peers[i].(*Raft)
 		entries := sm.RaftLog.allEntries()
+		// for _, entry := range entries {
+		// 	fmt.Println(entry.Index, entry.Term)
+		// }
 		if len(entries) != 2 {
 			t.Fatalf("node %d: len(entries) == %d, want 2", i, len(entries))
 		}
