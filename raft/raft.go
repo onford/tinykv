@@ -233,14 +233,14 @@ func (r *Raft) tick() {
 		r.electionElapsed++
 		if r.electionElapsed == r.electionActual {
 			r.becomeCandidate()
-			r.readMessages() // 发出新的请求之前，清空原有的请求
+			r.readMsgs() // 发出新的请求之前，清空原有的请求
 			r.sendVoteRequestToAll()
 		}
 	case StateCandidate:
 		r.electionElapsed++
 		if r.electionElapsed == r.electionActual {
 			r.becomeCandidate()
-			r.readMessages() // 发出新的请求之前，清空原有的请求
+			r.readMsgs() // 发出新的请求之前，清空原有的请求
 			r.sendVoteRequestToAll()
 		}
 	case StateLeader:
@@ -301,6 +301,7 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if r.Term < m.Term {
+		// 本地信息可以省略 Term 的。
 		r.becomeFollower(m.Term, None) // 老旧的任期将被淘汰，并变成 Follower，暂时不知道领导者是谁
 	}
 	if m.MsgType == pb.MessageType_MsgAppend {
@@ -313,12 +314,13 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
-			r.readMessages() // 发出新的请求之前，清空原有的请求
+			r.readMsgs() // 发出新的请求之前，清空原有的请求
 			r.sendVoteRequestToAll()
 			r.Lead = 0
 			if 2*r.Favors > uint64(len(r.Prs)) {
 				r.becomeLeader()
-				r.msgs = append(r.msgs, pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose})
+				r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose})
+				// r.msgs = append(r.msgs, pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgPropose})
 			} else if 2*r.Rejects >= uint64(len(r.Prs)) {
 				r.becomeFollower(r.Term, r.Lead)
 			}
@@ -348,7 +350,7 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
-			r.readMessages() // 发出新的请求之前，清空原有的请求
+			r.readMsgs() // 发出新的请求之前，清空原有的请求
 			for pr := range r.Prs {
 				if pr != r.id {
 					r.msgs = append(r.msgs, pb.Message{
@@ -619,4 +621,11 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) readMsgs() []pb.Message {
+	msgs := r.msgs
+	r.msgs = make([]pb.Message, 0)
+
+	return msgs
 }

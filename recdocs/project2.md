@@ -84,3 +84,11 @@ Raft 初始化时用到的 Storage 中有一个 HardState 项，这一项存储�
 - 领导人一般不会回应跟随着发来的心跳回复（MsgHeartbeatResponse），但若发现跟随者的日志更旧，则会作出回应。
 - 若 Follower 和 Candidate 的日志完全一样新，则应该接受 Candidate 的投票请求。
 - 我在 RaftLog 中新增了各个节点的 LastIndex 等数据。在更新这些数据的同时，需要更新对应 Raft 的 Prs，将 Match 和 Next 改为预期值。
+
+### Project 2ac
+这一部分用 RawNode 包装 Raft 节点进行测试。
+#### Ready 结构体
+- `Entries`字段：是“将要保存到 Storage 的日志文件入口”，所以该字段应该就是对应 RaftLog 中不稳定（unstable）的那些日志。
+- `CommittedEntries`字段：并不是所有已经提交的日志，而应该是在上一次 Advance 之后（Advance 需要更新 committed）的基础上，新增提交的那些日志。用一个 ready 记录 RawNode 上次 Advance 时提交到哪个位置了。 
+#### 注意事项
+- 注意本地消息 MessageType_MsgHup，MessageType_MsgBeat，MessageType_MsgPropose  在测试集中是省略 Term 的，因此它们的 Term 默认为0。为了不拒收本地消息，要适当地面向测试集编程。
